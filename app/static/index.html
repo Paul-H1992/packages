@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>包装预估 · 3D 装箱方案</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234d8dff'/%3E%3Cpath d='M16 6 26 11v10l-10 5-10-5V11z' fill='none' stroke='%23fff' stroke-width='2' stroke-linejoin='round'/%3E%3Cpath d='M6 11l10 5 10-5M16 16v10' fill='none' stroke='%23fff' stroke-width='2' stroke-linejoin='round'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <header class="brand">
+        <div class="brand-mark">3D</div>
+        <div>
+          <h1>包装预估</h1>
+          <p>瓶装 / 盒装 · 逐层堆叠 · 三维预览</p>
+        </div>
+      </header>
+
+      <section class="block">
+        <h2>1. 数据导入</h2>
+        <label class="file-drop" id="boxesDrop">
+          <input type="file" id="boxesFile" accept=".xlsx,.xls" hidden />
+          <span class="file-icon">📦</span>
+          <span class="file-text">
+            <strong>包装箱列表</strong>
+            <em id="boxesName">点击选择 Excel 文件</em>
+          </span>
+        </label>
+        <label class="file-drop" id="ordersDrop">
+          <input type="file" id="ordersFile" accept=".xlsx,.xls" hidden />
+          <span class="file-icon">🧾</span>
+          <span class="file-text">
+            <strong>订单明细</strong>
+            <em id="ordersName">点击选择 Excel 文件</em>
+          </span>
+        </label>
+        <div class="template-links">
+          <a href="/api/template/cartons">包装箱模板</a>
+          <span>·</span>
+          <a href="/api/template/orders">订单模板</a>
+        </div>
+      </section>
+
+      <section class="block">
+        <h2>2. 算法参数</h2>
+        <div class="field">
+          <label>瓶装排布</label>
+          <div class="segmented" id="patternGroup">
+            <button type="button" class="active" data-value="hex">六边形交错</button>
+            <button type="button" data-value="square">方形对齐</button>
+          </div>
+        </div>
+        <div class="field">
+          <label for="objective">选箱目标</label>
+          <select id="objective">
+            <option value="cartons">箱数最少（推荐）</option>
+            <option value="volume">总箱容积最小</option>
+            <option value="cost">总成本最低（需箱型单价）</option>
+          </select>
+        </div>
+        <div class="field two-col">
+          <div>
+            <label for="gapInput">物品间隙 (mm)</label>
+            <input type="number" id="gapInput" value="0" min="0" step="0.5" />
+          </div>
+          <div>
+            <label>盒装旋转</label>
+            <label class="switch">
+              <input type="checkbox" id="rotateBox" checked />
+              <span>允许水平 90°</span>
+            </label>
+          </div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="respectWeight" checked />
+          <span>遵守包装箱最大承重</span>
+        </label>
+      </section>
+
+      <section class="block">
+        <div class="actions">
+          <button class="btn primary" id="runBtn">开始预估</button>
+          <button class="btn ghost" id="sampleBtn">加载示例数据</button>
+        </div>
+        <p class="hint">瓶装始终直立、不旋转；层内紧密排布，层间堆叠。</p>
+      </section>
+
+      <section class="block grow">
+        <h2>3. 订单结果</h2>
+        <div id="orderList" class="order-list">
+          <p class="empty-hint">导入数据后，这里会显示合并后的订单列表。</p>
+        </div>
+      </section>
+
+      <div id="warnings" class="warnings"></div>
+    </aside>
+
+    <main class="main">
+      <div class="topbar">
+        <div class="title-wrap">
+          <h2 id="orderTitle">尚未选择订单</h2>
+          <p id="orderSubtitle">上传包装箱列表与订单明细，点击「开始预估」</p>
+        </div>
+        <div class="top-actions">
+          <button class="btn ghost small" id="exportBtn" disabled>导出方案 JSON</button>
+          <button class="btn ghost small" id="resetViewBtn" disabled>重置视角</button>
+        </div>
+      </div>
+
+      <div class="stage">
+        <div id="viewport"></div>
+
+        <div id="emptyState" class="empty-state">
+          <div class="empty-icon">📦</div>
+          <h3>3D 装箱方案预览</h3>
+          <p>上传 Excel 或加载示例数据，算法会输出每个订单的箱型、层数与摆放坐标，并在此三维呈现。</p>
+          <ul>
+            <li>圆瓶直立、不旋转，六边形交错紧密排布</li>
+            <li>一层一层向上堆叠，层高一致</li>
+            <li>鼠标左键旋转、滚轮缩放、右键平移</li>
+          </ul>
+        </div>
+
+        <div id="loading" class="loading hidden">
+          <div class="spinner"></div>
+          <span>正在计算装箱方案…</span>
+        </div>
+
+        <div id="tooltip" class="tooltip hidden"></div>
+
+        <div class="viewport-toolbar">
+          <div class="ctl">
+            <label for="layerSlider">层</label>
+            <input type="range" id="layerSlider" min="0" max="10" value="10" />
+            <output id="layerValue">全部</output>
+          </div>
+          <div class="ctl">
+            <label for="explodeSlider">层间展开</label>
+            <input type="range" id="explodeSlider" min="0" max="120" value="0" />
+            <output id="explodeValue">0 mm</output>
+          </div>
+          <label class="switch compact">
+            <input type="checkbox" id="showCarton" checked />
+            <span>箱体</span>
+          </label>
+          <label class="switch compact">
+            <input type="checkbox" id="autoRotate" />
+            <span>自动旋转</span>
+          </label>
+        </div>
+
+        <div class="stats" id="stats"></div>
+        <div class="legend" id="legend"></div>
+      </div>
+    </main>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script type="module" src="/static/app.js"></script>
+  <script>
+    // 若 Three.js CDN 不可达，给出可读提示
+    window.addEventListener('load', () => {
+      setTimeout(() => {
+        if (!window.__VIEWER_READY__) {
+          const el = document.getElementById('emptyState');
+          if (el) {
+            el.querySelector('p').textContent =
+              '三维库 Three.js 加载失败：请检查网络是否能访问 cdn.jsdelivr.net，或把 three 放到本地后修改 index.html 的 importmap。';
+          }
+        }
+      }, 5000);
+    });
+  </script>
+</body>
+</html>
