@@ -13,15 +13,27 @@ const PALETTE = [
   '#c084fc', '#facc15',
 ];
 
+const PRESET_DEFAULTS = {
+  '常温': { temp_min: 15, temp_max: 25, goods_ratio: 1.0, blue_ice: 0, dry_ice: 0, enabled: false },
+  '冷藏': { temp_min: 2, temp_max: 8, goods_ratio: 0.75, blue_ice: 0.25, dry_ice: 0, enabled: true },
+  '冷冻': { temp_min: -20, temp_max: -10, goods_ratio: 0.75, blue_ice: 0, dry_ice: 0.25, enabled: true },
+  '深冷': { temp_min: -80, temp_max: -60, goods_ratio: 0.7, blue_ice: 0, dry_ice: 0.3, enabled: true },
+};
+
 const state = {
   data: null,
   selected: -1,
+  candidate: 0,
   layerMax: 0,
   layerShow: 0,
   explode: 0,
   showCarton: true,
   autoRotate: false,
+  presets: JSON.parse(JSON.stringify(PRESET_DEFAULTS)),
+  files: { boxes: null, orders: null },
 };
+
+const COOLANT_COLORS = { blue_ice: '#4fc3ff', dry_ice: '#d6e8ff' };
 
 const $ = (id) => document.getElementById(id);
 
@@ -124,6 +136,11 @@ function colorForSku(sku) {
   return skuColors.get(sku);
 }
 
+function colorForCoolant(sku) {
+  const text = String(sku || '').toUpperCase();
+  return text.includes('DRY') ? COOLANT_COLORS.dry_ice : COOLANT_COLORS.blue_ice;
+}
+
 function buildScene(order) {
   clearScene();
 
@@ -166,7 +183,7 @@ function buildScene(order) {
     // 物品
     for (const p of cartonPlan.placements) {
       maxLayer = Math.max(maxLayer, p.layer);
-      const color = colorForSku(p.sku);
+      const color = p.is_coolant ? colorForCoolant(p.sku) : colorForSku(p.sku);
 
       let geometry;
       let px, py, pz;
@@ -185,8 +202,10 @@ function buildScene(order) {
 
       const material = new THREE.MeshStandardMaterial({
         color,
-        roughness: 0.55,
-        metalness: 0.04,
+        roughness: p.is_coolant ? 0.25 : 0.55,
+        metalness: p.is_coolant ? 0.15 : 0.04,
+        transparent: Boolean(p.is_coolant),
+        opacity: p.is_coolant ? 0.9 : 1,
       });
 
       const mesh = new THREE.Mesh(geometry, material);
@@ -357,7 +376,7 @@ function renderOrderList() {
         <span class="no">${order.order_no}</span>
         <span class="cartons">${order.carton_count} 箱</span>
       </div>
-      <div class="meta">${order.item_count} 件 · 填充 ${pct(order.fill_rate)}${warn}</div>
+      <div class="meta">${order.item_count} 件 · 填充 ${pct(order.fill_rate)}${order.order_type ? ` · ${order.order_type}` : ''}${warn}</div>
       <div class="bar"><i style="width:${Math.min(order.fill_rate * 100, 100).toFixed(1)}%"></i></div>
     `;
     button.addEventListener('click', () => selectOrder(index));
@@ -377,9 +396,16 @@ function renderWarnings() {
   });
 }
 
+function candidateList(order) {
+  if (!order) return [];
+  if (order.candidates && order.candidates.length) return order.candidates;
+  return [order];
+}
+
 function selectOrder(index) {
   if (!state.data || !state.data.orders[index]) return;
   state.selected = index;
+  state.candidate = 0;
 
   const order = state.data.orders[index];
 
@@ -387,26 +413,85 @@ function selectOrder(index) {
 
   $('emptyState').classList.add('hidden');
   $('orderTitle').textContent = order.order_no;
-  $('orderSubtitle').textContent = `${order.carton_count} 箱 · ${order.item_count} 件 · ${order.strategy || ''}`;
+  $('excelBtn').disabled = false;
   $('exportBtn').disabled = false;
   $('resetViewBtn').disabled = false;
 
-  buildScene(order);
-  renderStats(order);
-  renderLegend(order);
+  renderCandidateTabs(order);
+  selectCandidate(0);
 }
 
-function renderStats(order) {
+function selectCandidate(index) {
+  if (!state.data || state.selected < 0) return;
+  const order = state.data.orders[state.selected];
+  const cands = candidateList(order);
+  const cand = cands[index];
+  if (!cand) return;
+
+  state.candidate = index;
+  buildScene(cand);
+  renderStats(cand);
+  renderLegend(cand);
+  renderCandidateTabs(order);
+
+  const parts = [cand.label || '', cand.strategy || ''].filter(Boolean);
+  $('orderSubtitle').textContent =
+    `${parts.join(' · ')} · ${cand.carton_count} 箱 · ${cand.item_count} 件`;
+}
+
+function renderCandidateTabs(order) {
+  const bar = $('candidateBar');
+  bar.innerHTML = '';
+  const cands = order.candidates || [];
+  if (cands.length < 2) return;
+
+  cands.forEach((cand, i) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    const bad = !(cand.weight_ok && cand.coolant_ok && !(cand.unplaced && cand.unplaced.length));
+    button.className = 'cand-btn' + (i === state.candidate ? ' active' : '') + (bad ? ' bad' : '');
+    const codes = [...new Set(cand.cartons.map((c) => c.carton.code))].join('+') || '-';
+    const flag = !cand.weight_ok
+      ? '承重超标'
+      : !cand.coolant_ok
+        ? '冷媒未放全'
+        : (cand.unplaced && cand.unplaced.length)
+          ? `剩 ${cand.unplaced.reduce((n, u) => n + u.qty, 0)} 件`
+          : '';
+    button.innerHTML = `
+      <span class="cand-name">${cand.label || `方案${i + 1}`} · ${codes} × ${cand.carton_count}箱</span>
+      <span class="cand-meta">${cand.item_count} 件 · 填充 ${pct(cand.fill_rate)} · ${kg(cand.total_weight)}</span>
+      ${flag ? `<span class="cand-flag">${flag}</span>` : ''}
+    `;
+    button.addEventListener('click', () => selectCandidate(i));
+    bar.appendChild(button);
+  });
+}
+
+function renderStats(cand) {
   const box = $('stats');
-  const types = [...new Set(order.cartons.map((c) => c.carton.name || c.carton.code))];
-  const maxHeight = Math.max(0, ...order.cartons.map((c) => c.used_height));
+  if (!cand || !cand.cartons || !cand.cartons.length) {
+    box.innerHTML = '<div class="stat-row"><span>结果</span><b>无可用方案</b></div>';
+    return;
+  }
+
+  const types = [...new Set(cand.cartons.map((c) => c.carton.name || c.carton.code))];
+  const maxHeight = Math.max(0, ...cand.cartons.map((c) => c.used_height));
+  const temp = cand.temperature || {};
+  const coolant = (cand.coolant_usage || [])
+    .map((u) => `${u.kind_label || u.code}×${u.qty}`)
+    .join('、') || '无';
 
   const rows = [
+    ['订单类型', cand.order_type || '—'],
+    ['温度', temp.min !== undefined ? `${temp.min}~${temp.max}℃` : '—'],
     ['箱型', types.length === 1 ? types[0] : `${types.length} 种`],
-    ['箱数', `${order.carton_count}`],
-    ['件数', `${order.item_count}`],
-    ['填充率', pct(order.fill_rate)],
-    ['总重', kg(order.total_weight)],
+    ['箱数', `${cand.carton_count}`],
+    ['货品件数', `${cand.item_count}`],
+    ['冷媒', coolant],
+    ['填充率', pct(cand.fill_rate)],
+    ['总重(含冷媒)', kg(cand.total_weight)],
+    ['承重', cand.weight_ok ? '达标' : '超重'],
     ['最高堆高', `${Math.round(maxHeight)} mm`],
   ];
 
@@ -414,8 +499,8 @@ function renderStats(order) {
     .map(([label, value]) => `<div class="stat-row"><span>${label}</span><b>${value}</b></div>`)
     .join('');
 
-  if (order.unplaced.length) {
-    const count = order.unplaced.reduce((s, u) => s + u.qty, 0);
+  if (cand.unplaced && cand.unplaced.length) {
+    const count = cand.unplaced.reduce((s, u) => s + u.qty, 0);
     box.insertAdjacentHTML(
       'beforeend',
       `<div class="stat-row"><span>未装箱</span><b style="color:#ffb020">${count} 件</b></div>`,
@@ -423,15 +508,24 @@ function renderStats(order) {
   }
 }
 
-function renderLegend(order) {
+function renderLegend(cand) {
   const box = $('legend');
   box.innerHTML = '';
-  order.items.forEach((item) => {
+  (cand.items || []).forEach((item) => {
     const div = document.createElement('div');
     div.className = 'legend-item';
     div.innerHTML =
       `<span class="legend-dot" style="background:${colorForSku(item.sku)}"></span>` +
       `<span>${item.name || item.sku} × ${item.qty}</span>`;
+    box.appendChild(div);
+  });
+  (cand.coolant_usage || []).forEach((u) => {
+    if (!u.qty) return;
+    const div = document.createElement('div');
+    div.className = 'legend-item';
+    div.innerHTML =
+      `<span class="legend-dot" style="background:${colorForCoolant(u.code)}"></span>` +
+      `<span>${u.kind_label || u.code} × ${u.qty}（冷媒）</span>`;
     box.appendChild(div);
   });
 }
@@ -453,14 +547,81 @@ function setLoading(on) {
   $('loading').classList.toggle('hidden', !on);
 }
 
+function coolantSpec(prefix) {
+  return {
+    enabled: $(`${prefix}Enabled`).checked,
+    ratio: (Number($(`${prefix}Ratio`).value) || 0) / 100,
+    length: Number($(`${prefix}Length`).value) || 0,
+    width: Number($(`${prefix}Width`).value) || 0,
+    height: Number($(`${prefix}Height`).value) || 0,
+    weight: Number($(`${prefix}Weight`).value) || 0,
+  };
+}
+
+function loadPresetIntoForm(name) {
+  const preset = state.presets[name];
+  if (!preset) return;
+  $('tempMin').value = preset.temp_min;
+  $('tempMax').value = preset.temp_max;
+  $('goodsRatio').value = Math.round(preset.goods_ratio * 100);
+  $('blueRatio').value = Math.round(preset.blue_ice * 100);
+  $('dryRatio').value = Math.round(preset.dry_ice * 100);
+  $('blueEnabled').checked = preset.blue_ice > 0;
+  $('dryEnabled').checked = preset.dry_ice > 0;
+  $('coldEnabled').checked = preset.enabled;
+}
+
+function saveFormToPreset() {
+  const name = $('orderType').value;
+  if (name === 'custom' || !state.presets[name]) return;
+  state.presets[name] = {
+    temp_min: Number($('tempMin').value),
+    temp_max: Number($('tempMax').value),
+    goods_ratio: (Number($('goodsRatio').value) || 0) / 100,
+    blue_ice: $('blueEnabled').checked ? (Number($('blueRatio').value) || 0) / 100 : 0,
+    dry_ice: $('dryEnabled').checked ? (Number($('dryRatio').value) || 0) / 100 : 0,
+    enabled: $('coldEnabled').checked,
+  };
+}
+
 function readConfig() {
   const patternButton = document.querySelector('#patternGroup button.active');
+  saveFormToPreset();
   return {
     pattern: patternButton ? patternButton.dataset.value : 'hex',
     gap: Number($('gapInput').value) || 0,
     rotate_box: $('rotateBox').checked,
     respect_weight: $('respectWeight').checked,
     objective: $('objective').value,
+    top_k: Number($('topK').value) || 3,
+    weight_filter: $('weightFilter').checked,
+    cold_chain: {
+      enabled: $('coldEnabled').checked,
+      order_type: $('orderType').value,
+      temp_min: Number($('tempMin').value),
+      temp_max: Number($('tempMax').value),
+      ratio_basis: $('ratioBasis').value,
+      goods_ratio: (Number($('goodsRatio').value) || 0) / 100,
+      coolants: [
+        {
+          code: 'BLUE-ICE',
+          name: '蓝冰',
+          kind: 'blue_ice',
+          temp_min: 0,
+          temp_max: 10,
+          ...coolantSpec('blue'),
+        },
+        {
+          code: 'DRY-ICE',
+          name: '干冰',
+          kind: 'dry_ice',
+          temp_min: -100,
+          temp_max: -20,
+          ...coolantSpec('dry'),
+        },
+      ],
+      presets: state.presets,
+    },
   };
 }
 
@@ -480,9 +641,11 @@ function applyResult(data) {
   $('orderTitle').textContent = '尚未选择订单';
   $('orderSubtitle').textContent = `${data.orders.length} 个订单 · 共 ${data.summary.carton_count} 箱`;
   $('exportBtn').disabled = true;
+  $('excelBtn').disabled = true;
   $('resetViewBtn').disabled = true;
   $('stats').innerHTML = '';
   $('legend').innerHTML = '';
+  $('candidateBar').innerHTML = '';
   $('emptyState').classList.remove('hidden');
   clearScene();
 
@@ -499,6 +662,8 @@ async function runEstimate() {
     showToast('请先选择「包装箱列表」和「订单明细」两个 Excel 文件', true);
     return;
   }
+
+  state.files = { boxes, orders };
 
   const form = new FormData();
   form.append('boxes', boxes);
@@ -520,6 +685,7 @@ async function runEstimate() {
 }
 
 async function loadSample() {
+  state.files = { boxes: null, orders: null };
   setLoading(true);
   try {
     const response = await fetch('/api/sample');
@@ -592,6 +758,59 @@ $('autoRotate').addEventListener('change', (event) => {
 $('resetViewBtn').addEventListener('click', () => {
   if (state.selected >= 0) fitCamera();
 });
+
+async function exportExcel() {
+  if (!state.data) return;
+
+  setLoading(true);
+  try {
+    let response;
+    if (state.files.boxes && state.files.orders) {
+      const form = new FormData();
+      form.append('boxes', state.files.boxes);
+      form.append('orders', state.files.orders);
+      form.append('config', JSON.stringify(readConfig()));
+      response = await fetch('/api/export', { method: 'POST', body: form });
+    } else {
+      response = await fetch('/api/sample/export');
+    }
+    if (!response.ok) throw new Error(await parseError(response));
+
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = '订单装箱推荐方案.xlsx';
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast('已导出带「推荐装箱方案1/2/3」的 Excel');
+  } catch (error) {
+    showToast(String(error.message || error), true);
+  } finally {
+    setLoading(false);
+  }
+}
+
+$('excelBtn').addEventListener('click', exportExcel);
+
+$('orderType').addEventListener('change', () => {
+  const name = $('orderType').value;
+  if (name !== 'custom') loadPresetIntoForm(name);
+});
+
+['tempMin', 'tempMax', 'goodsRatio', 'blueRatio', 'dryRatio'].forEach((id) => {
+  $(id).addEventListener('input', saveFormToPreset);
+});
+
+['blueEnabled', 'dryEnabled', 'coldEnabled'].forEach((id) => {
+  $(id).addEventListener('change', () => {
+    if (id === 'blueEnabled' && !$(id).checked) $('blueRatio').value = '0';
+    if (id === 'dryEnabled' && !$(id).checked) $('dryRatio').value = '0';
+    saveFormToPreset();
+  });
+});
+
+loadPresetIntoForm('冷藏');
 
 $('exportBtn').addEventListener('click', () => {
   if (!state.data || state.selected < 0) return;

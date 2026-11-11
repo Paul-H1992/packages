@@ -451,3 +451,45 @@ python -m pytest tests/ -q
 ## 附：一句话记住算法
 
 > **逐层选主货、点阵铺满、MaxRects 塞缝、码完抬升、装不下换箱、多箱型比箱数。**
+
+---
+
+## 9. v0.2 扩展：冷链（蓝冰 / 干冰）、承重过滤、Top3、Excel 导出
+
+### 9.1 新增模块
+
+| 模块 | 文件 | 作用 |
+| --- | --- | --- |
+| 冷媒规格 `CoolantSpec` | `app/coldchain.py` | 蓝冰 / 干冰的单块尺寸、重量、可维持温度、占比 |
+| 冷链配置 `ColdChainConfig` | `app/coldchain.py` | 温度区间、货物/冷媒占比、占比基准、订单类型预设 |
+| 用量计算 `coolant_requirements()` | `app/coldchain.py` | 按占比算每种冷媒需要几块（向上取整） |
+| 订单类型预设 `PRESETS` | `app/coldchain.py` | 常温 / 冷藏 / 冷冻 / 深冷的内置温度与占比，可被前端覆盖 |
+| 冷媒段装箱 | `app/packer.py: pack_carton()` | 货物先码、冷媒后码在顶部；空间不够时压低货物高度重排 |
+| 承重预留与过滤 | `app/packer.py` | 货物可用承重 = (限重−自重)/(1+冷媒比)；超重方案降级 |
+| Top-K 候选 | `app/packer.py: optimize_order()` | 单箱型、A+B 收尾、混合补齐，去重后取前 K 套 |
+| Excel 导出 | `app/excel_io.py: export_with_recommendations()` | 在原订单表右侧追加「推荐装箱方案1/2/3」并附明细 sheet |
+
+### 9.2 占比公式
+
+```
+冷媒需求量 = 货物量 × (冷媒占比 ÷ 货物占比)
+冷媒块数   = ⌈需求量 ÷ 单块重量(或体积)⌉
+```
+
+### 9.3 新增/变更的接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/estimate` | 支持 `config.cold_chain`（温度、占比、冷媒规格、订单类型预设）与 `top_k` / `weight_filter` |
+| POST | `/api/export` | 返回追加推荐列的 Excel |
+| GET | `/api/sample/export` | 用示例数据导出推荐 Excel |
+
+### 9.4 返回结构变化
+
+- 每个订单新增 `candidates` 数组（方案1/2/3），顶层字段仍等于方案1，兼容原前端；
+- 每套方案新增：`order_type`、`temperature`、`coolant_usage`、`coolant_weight`、`weight_ok`、`coolant_ok`、`reason`；
+- 每个箱子新增：`goods_weight`、`coolant_weight`、`coolant_items`、`total_weight`、`weight_ok`、`coolant_ok`、`goods_count`、`coolant_count`。
+
+### 9.5 测试
+
+新增 10 个测试：占比用量、按体积基准、冷媒在货物上方、冷链关闭、Top-K 数量、承重过滤、Excel 导出列、订单类型读取与预设。当前 **23 个测试全部通过**。

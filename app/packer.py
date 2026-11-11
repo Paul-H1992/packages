@@ -25,8 +25,11 @@ GitHub 上主流的通用 3D bin packing 库（如 ``enzoruiz/3dbinpacking``(py3
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Iterable, Sequence
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any, Iterable, Sequence
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .coldchain import ColdChainConfig
 
 from .models import (
     EPS,
@@ -280,6 +283,7 @@ def _plan_layer(
                 layer=layer_no,
                 seq=seq,
                 weight=item.weight,
+                is_coolant=item.is_coolant,
             )
         )
         seq += 1
@@ -347,21 +351,26 @@ def _plan_layer(
 # ---------------------------------------------------------------------------
 
 
-def pack_carton(
+def _placement_volume(p: Placement) -> float:
+    """单件物品体积（瓶装按圆柱，盒装按长方体）。"""
+    if p.kind == "bottle":
+        return math.pi * (p.d / 2.0) ** 2 * p.h
+    return p.w * p.l * p.h
+
+
+def _place_layers(
     carton: Carton,
     pool: list[list],
     cfg: PackConfig,
-    index: int = 0,
-) -> CartonPlan:
-    """把 ``pool``（就地扣减）装进一个包装箱。"""
-    placements: list[Placement] = []
-    layer_infos: list[LayerInfo] = []
-    z = 0.0
-    layer_no = 0
-    seq = 0
-    weight_left = carton.max_weight if math.isfinite(carton.max_weight) else math.inf
+    z: float,
+    layer_no: int,
+    seq: int,
+    weight_left: float,
+    placements: list[Placement],
+    layer_infos: list[LayerInfo],
+) -> tuple[float, int, int, float]:
+    """从高度 ``z`` 开始逐层码放 ``pool``，就地扣减数量。"""
     guard = 0
-
     while z < carton.height - EPS:
         guard += 1
         if guard > 10000:
@@ -378,6 +387,7 @@ def pack_carton(
         placements.extend(layer.placements)
         seq += len(layer.placements)
         weight_left -= layer.weight
+
         skus: list[str] = []
         for p in layer.placements:
             if p.sku not in skus:
@@ -394,8 +404,145 @@ def pack_carton(
         z += layer.height
         layer_no += 1
 
-    weight = sum(p.weight for p in placements)
-    used_volume = sum(p.w * p.l * p.h if p.kind == "box" else math.pi * (p.d / 2) ** 2 * p.h for p in placements)
+    return z, layer_no, seq, weight_left
+
+
+def pack_carton(
+    carton: Carton,
+    pool: list[list],
+    cfg: PackConfig,
+    index: int = 0,
+    cold: "ColdChainConfig | None" = None,
+) -> CartonPlan:
+    """把 ``pool``（货物，就地扣减）装进一个包装箱。
+
+    分两段：
+    1. **货物段**：从箱底开始逐层码放货物；
+    2. **冷媒段**：按货物重量/体积与占比算出本箱冷媒数量，码放在货物**上方**。
+
+    装箱时会给冷媒预留承重：货物的可用承重 = (箱限重 - 箱自重) / (1 + 冷媒/货物重量比)。
+    """
+    placements: list[Placement] = []
+    layer_infos: list[LayerInfo] = []
+    z = 0.0
+    layer_no = 0
+    seq = 0
+
+    cold_enabled = cold is not None and cold.enabled
+
+    # 冷媒会占重量：先估一个预留比例，避免货物把承重吃满
+    reserve = 0.0
+    if cold_enabled and cold is not None:
+        pool_weight = sum(item.weight * qty for item, qty in pool)
+        pool_volume = sum(item.volume * qty for item, qty in pool)
+        reserve = cold.weight_reserve_ratio(pool_weight, pool_volume)
+
+    max_weight = carton.max_weight if math.isfinite(carton.max_weight) else math.inf
+    if cfg.respect_weight and math.isfinite(max_weight):
+        payload = max(max_weight - carton.tare_weight, 0.0)
+        goods_cap = payload / (1.0 + reserve) if reserve > 0 else payload
+    else:
+        goods_cap = math.inf
+
+    # ---- 1. 货物（冷媒需要空间时，逐次压低货物可用高度） ----
+    snapshot = [qty for _, qty in pool]
+    floor_area = max(carton.length * carton.width, EPS)
+    reserve_h = 0.0
+    requirements: list[tuple[Any, int]] = []
+    goods_weight = 0.0
+    goods_volume = 0.0
+
+    for attempt in range(4):
+        # 还原货品数量，重新从箱底码放
+        for entry, qty in zip(pool, snapshot):
+            entry[1] = qty
+        placements.clear()
+        layer_infos.clear()
+        z = 0.0
+        layer_no = 0
+        seq = 0
+
+        if reserve_h > EPS:
+            goods_carton = replace(carton, height=max(carton.height - reserve_h, 1.0))
+        else:
+            goods_carton = carton
+
+        weight_left = goods_cap if cfg.respect_weight else math.inf
+        z, layer_no, seq, _weight_left = _place_layers(
+            goods_carton, pool, cfg, z, layer_no, seq, weight_left, placements, layer_infos
+        )
+
+        goods_weight = sum(p.weight for p in placements)
+        goods_volume = sum(_placement_volume(p) for p in placements)
+        requirements = (
+            cold.coolant_requirements(goods_weight, goods_volume)
+            if (cold_enabled and cold is not None and placements)
+            else []
+        )
+        if not requirements:
+            break
+
+        coolant_volume = sum(spec.volume * qty for spec, qty in requirements)
+        need_h = coolant_volume / floor_area
+        # 冷媒是一层一层码的：高度至少按一层冷媒的高度向上取整
+        min_cool_h = min((spec.height for spec, _ in requirements), default=0.0)
+        if min_cool_h > EPS:
+            need_h = math.ceil(need_h / min_cool_h) * min_cool_h
+        if need_h <= EPS:
+            break
+        if z + need_h <= carton.height + 1.0:
+            break
+        # 冷媒放不下：给货物让出高度后重排
+        reserve_h = min(carton.height * 0.7, need_h * 1.05 + 2.0)
+
+    # ---- 2. 冷媒（码在货物上方） ----
+    coolant_weight = 0.0
+    coolant_items: list[dict] = []
+    coolant_ok = True
+
+    if cold_enabled and cold is not None and placements:
+        if requirements:
+            coolant_pool: list[list] = [[spec.to_item(qty), qty] for spec, qty in requirements]
+
+            if cfg.respect_weight and math.isfinite(max_weight):
+                coolant_budget = max(max_weight - carton.tare_weight - goods_weight, 0.0)
+            else:
+                coolant_budget = math.inf
+
+            z, layer_no, seq, _ = _place_layers(
+                carton,
+                coolant_pool,
+                cfg,
+                z,
+                layer_no,
+                seq,
+                coolant_budget,
+                placements,
+                layer_infos,
+            )
+
+            remaining = {item.sku: qty for item, qty in coolant_pool}
+            for spec, required in requirements:
+                placed = required - remaining.get(spec.code, 0)
+                placed = max(0, min(placed, required))
+                coolant_weight += placed * spec.weight
+                coolant_items.append(
+                    {
+                        "code": spec.code,
+                        "name": spec.display_name,
+                        "kind": spec.kind,
+                        "kind_label": spec.kind_label,
+                        "required": required,
+                        "placed": placed,
+                        "unit_weight": round(spec.weight, 2),
+                        "weight": round(placed * spec.weight, 2),
+                    }
+                )
+                if placed < required:
+                    coolant_ok = False
+
+    weight = goods_weight + coolant_weight
+    used_volume = sum(_placement_volume(p) for p in placements)
     used_height = max((p.top for p in placements), default=0.0)
 
     return CartonPlan(
@@ -406,6 +553,10 @@ def pack_carton(
         used_volume=used_volume,
         used_height=used_height,
         layers=layer_infos,
+        goods_weight=goods_weight,
+        coolant_weight=coolant_weight,
+        coolant_items=coolant_items,
+        coolant_ok=coolant_ok,
     )
 
 
@@ -413,6 +564,7 @@ def pack_into(
     carton: Carton,
     items: Iterable[Item],
     cfg: PackConfig,
+    cold: "ColdChainConfig | None" = None,
 ) -> tuple[list[CartonPlan], list[tuple[Item, int]]]:
     """用同一种包装箱重复装箱，直到装不下或货品装完。"""
     pool: list[list] = [[item, item.qty] for item in items if item.qty > 0]
@@ -423,7 +575,7 @@ def pack_into(
         guard += 1
         if guard > 10000:
             break
-        plan = pack_carton(carton, pool, cfg, index=len(plans))
+        plan = pack_carton(carton, pool, cfg, index=len(plans), cold=cold)
         if not plan.placements:
             break
         plans.append(plan)
@@ -433,7 +585,7 @@ def pack_into(
 
 
 # ---------------------------------------------------------------------------
-# 订单级：选箱 + 多箱
+# 订单级：选箱 + 多箱 + Top-K 候选
 # ---------------------------------------------------------------------------
 
 
@@ -460,6 +612,7 @@ def _complete_mixed(
     plans: list[CartonPlan],
     leftover: list[tuple[Item, int]],
     cfg: PackConfig,
+    cold: "ColdChainConfig | None" = None,
 ) -> tuple[list[CartonPlan], list[tuple[Item, int]]]:
     """当单一箱型装不完时，用其他箱型补齐剩余货品。"""
     remaining = list(leftover)
@@ -478,13 +631,14 @@ def _complete_mixed(
             ]
             if not candidates:
                 continue
-            new_plans, _left = pack_into(carton, candidates, cfg)
+            new_plans, _left = pack_into(carton, candidates, cfg, cold=cold)
             if not new_plans:
                 continue
             packed: dict[str, int] = {}
             for plan in new_plans:
                 for p in plan.placements:
-                    packed[p.sku] = packed.get(p.sku, 0) + 1
+                    if p.sku:
+                        packed[p.sku] = packed.get(p.sku, 0) + 1
             if not packed:
                 continue
             progress = True
@@ -497,8 +651,146 @@ def _complete_mixed(
         if not progress:
             break
 
-    _reindex(plans)
     return plans, remaining
+
+
+@dataclass
+class _Option:
+    """一种候选装箱方案（对应一种选箱策略）。"""
+
+    plans: list[CartonPlan]
+    leftover: list[tuple[Item, int]]
+    fill: float
+    strategy: str
+    carton_code: str
+    carton_count: int
+    total_volume: float
+    total_cost: float
+    cost_known: bool
+    total_weight: float
+    weight_ok: bool
+    coolant_ok: bool
+    leftover_units: int
+
+    @property
+    def signature(self) -> tuple:
+        return (self.carton_count, tuple(sorted(p.carton.code for p in self.plans)))
+
+
+def _make_option(
+    plans: list[CartonPlan],
+    leftover: list[tuple[Item, int]],
+    strategy: str,
+    carton_code: str = "",
+) -> _Option:
+    _reindex(plans)
+    used = sum(p.used_volume for p in plans)
+    capacity = sum(p.carton.volume for p in plans)
+    prices = [p.carton.price for p in plans]
+    cost_known = bool(prices) and all(price is not None for price in prices)
+    cost = sum(price for price in prices if price is not None)
+    codes = sorted({p.carton.code for p in plans})
+    return _Option(
+        plans=plans,
+        leftover=list(leftover),
+        fill=used / capacity if capacity else 0.0,
+        strategy=strategy,
+        carton_code=carton_code or (codes[0] if len(codes) == 1 else "+".join(codes)),
+        carton_count=len(plans),
+        total_volume=capacity,
+        total_cost=cost,
+        cost_known=cost_known,
+        total_weight=sum(p.total_weight for p in plans),
+        weight_ok=all(p.weight_ok for p in plans),
+        coolant_ok=all(p.coolant_ok for p in plans),
+        leftover_units=sum(q for _, q in leftover),
+    )
+
+
+def _rank(opt: _Option, cfg: PackConfig) -> tuple:
+    """排序键（越小越优）：先保「装得下 + 冷媒放得下 + 承重达标」，再按目标。"""
+    validity = 0
+    if not opt.coolant_ok:
+        validity += 2
+    if cfg.weight_filter and not opt.weight_ok:
+        validity += 4
+    has_left = 0 if not opt.leftover else 1
+    base = (validity, has_left, opt.leftover_units)
+
+    if cfg.objective == "volume":
+        return base + (opt.total_volume, opt.carton_count, -opt.fill)
+    if cfg.objective == "cost" and opt.cost_known:
+        return base + (opt.total_cost, opt.carton_count, -opt.fill)
+    return base + (opt.carton_count, -opt.fill)
+
+
+def _reason(opt: _Option, cfg: PackConfig) -> str:
+    parts: list[str] = []
+    label = {"cartons": "箱数最少", "volume": "总箱容积最小", "cost": "总成本最低"}.get(
+        cfg.objective, "箱数最少"
+    )
+    parts.append(label)
+    if not opt.leftover:
+        parts.append("货物全部装箱")
+    else:
+        parts.append(f"剩余 {opt.leftover_units} 件未装")
+    if opt.coolant_ok:
+        parts.append("冷媒全部放下")
+    else:
+        parts.append("冷媒未全部放下")
+    if opt.weight_ok:
+        parts.append("承重达标")
+    else:
+        parts.append("承重超标")
+    return "；".join(parts)
+
+
+def _aggregate_coolants(plans: list[CartonPlan]) -> list[dict]:
+    usage: dict[str, dict] = {}
+    for plan in plans:
+        for item in plan.coolant_items:
+            entry = usage.setdefault(
+                item["code"],
+                {
+                    "code": item["code"],
+                    "name": item.get("name", ""),
+                    "kind": item.get("kind", ""),
+                    "kind_label": item.get("kind_label", ""),
+                    "qty": 0,
+                    "weight": 0.0,
+                    "unit_weight": item.get("unit_weight", 0.0),
+                },
+            )
+            entry["qty"] += int(item.get("placed", 0))
+            entry["weight"] = round(entry["weight"] + float(item.get("weight", 0.0)), 2)
+    return list(usage.values())
+
+
+def _build_order_plan(
+    order_no: str,
+    items: list[Item],
+    oversize: list[Item],
+    opt: _Option,
+    rank: int,
+    cfg: PackConfig,
+    cold: "ColdChainConfig | None",
+) -> OrderPlan:
+    _reindex(opt.plans)
+    temperature = cold.temp_range if cold is not None else (15.0, 25.0)
+    return OrderPlan(
+        order_no=order_no,
+        items=list(items),
+        cartons=list(opt.plans),
+        unplaced=list(opt.leftover),
+        oversize=oversize,
+        strategy=opt.strategy,
+        rank=rank,
+        label=f"方案{rank}",
+        order_type=cold.order_type if cold is not None else "",
+        temperature=temperature,
+        coolant_usage=_aggregate_coolants(opt.plans),
+        reason=_reason(opt, cfg),
+    )
 
 
 def optimize_order(
@@ -506,9 +798,13 @@ def optimize_order(
     items: Sequence[Item],
     cartons: Sequence[Carton],
     cfg: PackConfig,
-) -> OrderPlan:
-    """为单个订单挑选最优箱型并完成装箱。"""
-    items = [item for item in items if item.qty > 0]
+    cold: "ColdChainConfig | None" = None,
+) -> list[OrderPlan]:
+    """为单个订单生成 Top-K 候选方案（默认 3 套：方案1/2/3）。
+
+    返回按推荐度排序的 :class:`OrderPlan` 列表；列表为空表示没有任何箱型装得下。
+    """
+    items = [item for item in items if item.qty > 0 and not item.is_coolant]
     packable: list[Item] = []
     oversize: list[Item] = []
     for item in items:
@@ -518,72 +814,128 @@ def optimize_order(
             oversize.append(item)
 
     if not cartons or not packable:
-        return OrderPlan(
-            order_no=order_no,
-            items=list(items),
-            cartons=[],
-            unplaced=[(item, item.qty) for item in packable],
-            oversize=oversize,
-            strategy="无可用箱型",
-        )
+        if not items:
+            return []
+        # 没有任何箱型装得下：返回一个占位方案，保留超规/未装信息
+        return [
+            OrderPlan(
+                order_no=order_no,
+                items=list(items),
+                cartons=[],
+                unplaced=[(item, item.qty) for item in packable],
+                oversize=oversize,
+                strategy="无法装箱",
+                rank=1,
+                label="方案1",
+                order_type=cold.order_type if cold is not None else "",
+                temperature=cold.temp_range if cold is not None else (15.0, 25.0),
+                reason="货品尺寸超过所有包装箱",
+            )
+        ]
 
-    options = []
+    options: list[_Option] = []
     for carton in cartons:
-        plans, leftover = pack_into(carton, packable, cfg)
+        plans, leftover = pack_into(carton, packable, cfg, cold=cold)
         if not plans:
             continue
-        used = sum(p.used_volume for p in plans)
-        capacity = sum(p.carton.volume for p in plans)
         options.append(
-            {
-                "carton": carton,
-                "plans": plans,
-                "leftover": leftover,
-                "leftover_units": sum(q for _, q in leftover),
-                "fill": used / capacity if capacity else 0.0,
-            }
+            _make_option(plans, leftover, f"单一箱型 {carton.display_name}", carton_code=carton.code)
         )
+
+    # 「先装一箱 A，余量用 B 收尾」：最贴近现场操作，也能产出 1×XL + 1×L 这类实用组合
+    for carton_a in cartons:
+        for carton_b in cartons:
+            if carton_a is carton_b:
+                continue
+            first_pool: list[list] = [[item, item.qty] for item in packable]
+            first = pack_carton(carton_a, first_pool, cfg, index=0, cold=cold)
+            if not first.placements:
+                continue
+            rest = [(item, qty) for item, qty in first_pool if qty > 0]
+            if not rest:
+                continue
+            rest_items = [item.clone(qty) for item, qty in rest]
+            plans_b, left_b = pack_into(carton_b, rest_items, cfg, cold=cold)
+            if not plans_b:
+                continue
+            options.append(
+                _make_option(
+                    [first] + plans_b,
+                    left_b,
+                    f"1×{carton_a.code} + {carton_b.code} 收尾",
+                )
+            )
+
+    # 两种箱型组合：A 装满后用 B 收尾（更贴近实际混装场景）
+    pair_seen: set[tuple[str, str]] = set()
+    for carton_a in cartons:
+        for carton_b in cartons:
+            if carton_a is carton_b:
+                continue
+            pair_key = (carton_a.code, carton_b.code)
+            if pair_key in pair_seen:
+                continue
+            pair_seen.add(pair_key)
+            plans_a, left_a = pack_into(carton_a, packable, cfg, cold=cold)
+            if not plans_a or not left_a:
+                continue
+            rest = [item.clone(qty) for item, qty in left_a]
+            plans_b, left_b = pack_into(carton_b, rest, cfg, cold=cold)
+            if not plans_b:
+                continue
+            options.append(
+                _make_option(
+                    plans_a + plans_b,
+                    left_b,
+                    f"{carton_a.code} + {carton_b.code} 组合",
+                )
+            )
+
+    # 单箱型装不全的，再尝试混合箱型补齐
+    mixed: list[_Option] = []
+    for opt in options:
+        if not opt.leftover:
+            continue
+        plans, left = _complete_mixed(cartons, list(opt.plans), opt.leftover, cfg, cold=cold)
+        if len(plans) > len(opt.plans):
+            mixed.append(_make_option(plans, left, "混合箱型补齐"))
+    options.extend(mixed)
 
     if not options:
-        return OrderPlan(
-            order_no=order_no,
-            items=list(items),
-            cartons=[],
-            unplaced=[(item, item.qty) for item in packable],
-            oversize=oversize,
-            strategy="无法装箱",
-        )
+        return []
 
-    # 排序键：先看是否有剩余，再按选箱目标排序
-    def rank(opt: dict) -> tuple:
-        has_left = 0 if not opt["leftover"] else 1
-        count = len(opt["plans"])
-        total_volume = sum(p.carton.volume for p in opt["plans"])
-        prices = [p.carton.price for p in opt["plans"]]
-        total_cost = sum(price for price in prices if price is not None)
+    k = max(1, int(cfg.top_k or 3))
 
-        if cfg.objective == "volume":
-            return (has_left, opt["leftover_units"], total_volume, count)
-        if cfg.objective == "cost" and all(price is not None for price in prices):
-            return (has_left, opt["leftover_units"], total_cost, count)
-        # 默认：箱数最少，其次填充率最高
-        return (has_left, opt["leftover_units"], count, -opt["fill"])
+    # 先按目标排序，不够 K 个再用「填充率」「总重」补充，保证去重
+    ordered: list[_Option] = []
+    seen: set[tuple] = set()
 
-    best = min(options, key=rank)
-    plans: list[CartonPlan] = best["plans"]
-    leftover: list[tuple[Item, int]] = best["leftover"]
-    strategy = f"单一箱型 {best['carton'].display_name}"
+    def push(candidates: Iterable[_Option]) -> None:
+        for opt in candidates:
+            if len(ordered) >= k:
+                return
+            if opt.signature in seen:
+                continue
+            seen.add(opt.signature)
+            ordered.append(opt)
 
-    if leftover:
-        plans, leftover = _complete_mixed(cartons, plans, leftover, cfg)
-        strategy = f"主箱型 {best['carton'].display_name} + 其他箱型补齐"
+    # 备选方案要「像样」：箱数明显偏多的方案（> 最优箱数 + 2）排到最后
+    best_count = min(o.carton_count for o in options)
 
-    _reindex(plans)
-    return OrderPlan(
-        order_no=order_no,
-        items=list(items),
-        cartons=plans,
-        unplaced=leftover,
-        oversize=oversize,
-        strategy=strategy,
-    )
+    def sane(o: _Option) -> int:
+        return 0 if o.carton_count <= best_count + 2 else 1
+
+    push(sorted(options, key=lambda o: _rank(o, cfg)))
+    if len(ordered) < k:
+        push(sorted(options, key=lambda o: (sane(o), o.leftover_units, o.carton_count, o.total_volume)))
+    if len(ordered) < k:
+        push(sorted(options, key=lambda o: (sane(o), o.leftover_units, o.carton_count, -o.fill)))
+    if len(ordered) < k:
+        push(sorted(options, key=lambda o: (sane(o), o.leftover_units, o.total_weight, o.carton_count)))
+    if len(ordered) < k:
+        push(sorted(options, key=lambda o: (sane(o), o.carton_count)))
+
+    return [
+        _build_order_plan(order_no, items, oversize, opt, rank, cfg, cold)
+        for rank, opt in enumerate(ordered[:k], start=1)
+    ]

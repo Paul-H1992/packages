@@ -42,6 +42,7 @@ CARTON_ALIASES: dict[str, set[str]] = {
     "height": {"内高", "高度", "高", "height", "h", "高(mm)", "内高(mm)"},
     "max_weight": {"最大承重", "承重", "限重", "载重", "最大重量", "max_weight", "maxweight", "weight_limit", "承重(g)"},
     "price": {"单价", "价格", "成本", "箱价", "price", "cost"},
+    "tare_weight": {"箱自重", "自重", "皮重", "空箱重量", "tare", "tare_weight"},
 }
 
 ORDER_ALIASES: dict[str, set[str]] = {
@@ -55,6 +56,7 @@ ORDER_ALIASES: dict[str, set[str]] = {
     "height": {"高", "高度", "瓶高", "货品高", "货品高度", "height", "h", "高(mm)", "外高"},
     "weight": {"单重", "重量", "单件重量", "净重", "毛重", "weight", "unit_weight", "单重(g)"},
     "qty": {"数量", "件数", "订购数量", "订单数量", "qty", "quantity", "num", "count"},
+    "order_type": {"订单类型", "温层", "温区", "运输类型", "order_type", "ordertype", "temperature_type"},
 }
 
 ITEM_ALIASES = {k: v for k, v in ORDER_ALIASES.items() if k not in {"order_no", "qty"}}
@@ -142,11 +144,11 @@ def _map_columns(row: Iterable[Any], aliases: dict[str, set[str]]) -> dict[str, 
     return mapping
 
 
-def _load_table(ws, aliases: dict[str, set[str]]) -> tuple[list[dict[str, Any]], dict[str, Optional[int]]]:
-    """读取一个 sheet，返回 (记录列表, 列映射)。自动定位表头行。"""
+def _locate_table(ws, aliases: dict[str, set[str]]) -> tuple[int, dict[str, Optional[int]], list]:
+    """定位表头行，返回 (表头行 0 基下标, 列映射, 全部行数据)。"""
     rows = list(ws.iter_rows(values_only=True))
     if not rows:
-        return [], {}
+        return -1, {}, rows
 
     best_row = -1
     best_score = -1
@@ -156,8 +158,15 @@ def _load_table(ws, aliases: dict[str, set[str]]) -> tuple[list[dict[str, Any]],
         score = sum(1 for v in mapping.values() if v is not None)
         if score > best_score:
             best_row, best_score, best_map = i, score, mapping
+    return best_row, best_map, rows
 
-    if best_row < 0 or best_score < 2:
+
+def _load_table(ws, aliases: dict[str, set[str]]) -> tuple[list[dict[str, Any]], dict[str, Optional[int]]]:
+    """读取一个 sheet，返回 (记录列表, 列映射)。自动定位表头行。"""
+    best_row, best_map, rows = _locate_table(ws, aliases)
+    if best_row < 0:
+        return [], {}
+    if sum(1 for v in best_map.values() if v is not None) < 2:
         return [], {}
 
     records: list[dict[str, Any]] = []
@@ -233,6 +242,7 @@ def read_cartons(source: str | Path | io.BytesIO) -> tuple[list[Carton], list[st
 
         max_weight = parse_number(record.get("max_weight"))
         price = parse_number(record.get("price"))
+        tare_weight = parse_number(record.get("tare_weight")) or 0.0
 
         carton = Carton(
             code=code,
@@ -242,6 +252,7 @@ def read_cartons(source: str | Path | io.BytesIO) -> tuple[list[Carton], list[st
             height=float(height),
             max_weight=float(max_weight) if max_weight and max_weight > 0 else float("inf"),
             price=float(price) if price else None,
+            tare_weight=float(tare_weight) if tare_weight > 0 else 0.0,
         )
         try:
             carton.validate()
@@ -265,6 +276,7 @@ def read_cartons(source: str | Path | io.BytesIO) -> tuple[list[Carton], list[st
 class MergedOrder:
     order_no: str
     items: list[Item] = field(default_factory=list)
+    order_type: str = ""
 
     @property
     def total_qty(self) -> int:
@@ -365,6 +377,7 @@ def read_orders(source: str | Path | io.BytesIO) -> tuple[list[MergedOrder], lis
 
     # 合并同订单同 SKU
     merged: "OrderedDict[str, OrderedDict[str, list]]" = OrderedDict()
+    order_types: dict[str, str] = {}
     for record in detail_records:
         order_no = str(record.get("order_no") or "").strip()
         sku = str(record.get("sku") or "").strip()
@@ -374,6 +387,10 @@ def read_orders(source: str | Path | io.BytesIO) -> tuple[list[MergedOrder], lis
         if not qty or qty <= 0:
             warnings.append(f"订单 {order_no} 的货品 {sku} 数量无效，已忽略")
             continue
+
+        order_type = str(record.get("order_type") or "").strip()
+        if order_type and not order_types.get(order_no):
+            order_types[order_no] = order_type
 
         bucket = merged.setdefault(order_no, OrderedDict())
         if sku not in bucket:
@@ -407,7 +424,13 @@ def read_orders(source: str | Path | io.BytesIO) -> tuple[list[MergedOrder], lis
                 continue
             items.append(item)
         if items:
-            orders.append(MergedOrder(order_no=order_no, items=items))
+            orders.append(
+                MergedOrder(
+                    order_no=order_no,
+                    items=items,
+                    order_type=order_types.get(order_no, ""),
+                )
+            )
         else:
             warnings.append(f"订单 {order_no} 没有可用的货品，已跳过")
 
@@ -439,10 +462,10 @@ def _write_sheet(ws, headers: list[str], rows: list[list[Any]]) -> None:
 
 
 SAMPLE_CARTONS: list[list[Any]] = [
-    ["CTN-S", "小号箱", 250, 200, 150, 6000, 2.2],
-    ["CTN-M", "中号箱", 400, 300, 250, 12000, 3.5],
-    ["CTN-L", "大号箱", 500, 400, 350, 20000, 5.8],
-    ["CTN-XL", "超大箱", 600, 500, 450, 30000, 8.6],
+    ["CTN-S", "小号箱", 250, 200, 150, 6000, 2.2, 120],
+    ["CTN-M", "中号箱", 400, 300, 250, 12000, 3.5, 220],
+    ["CTN-L", "大号箱", 500, 400, 350, 20000, 5.8, 320],
+    ["CTN-XL", "超大箱", 600, 500, 450, 30000, 8.6, 450],
 ]
 
 SAMPLE_ITEMS: list[list[Any]] = [
@@ -454,17 +477,18 @@ SAMPLE_ITEMS: list[list[Any]] = [
     ["BOX-1000", "1kg 方盒", "盒装", None, 200, 200, 100, 1080],
 ]
 
+# [订单号, 货品编码, 数量, 订单类型]
 SAMPLE_ORDER_ROWS: list[list[Any]] = [
-    ["SO20241107001", "BTL-500", None, None, None, None, 24],
-    ["SO20241107001", "BTL-500", None, None, None, None, 12],  # 同一 SKU 两行 → 合并为 36
-    ["SO20241107001", "BOX-500", None, None, None, None, 10],
-    ["SO20241107002", "BTL-1000", None, None, None, None, 18],
-    ["SO20241107002", "BOX-200", None, None, None, None, 24],
-    ["SO20241107002", "BOX-1000", None, None, None, None, 6],
-    ["SO20241107003", "BTL-330", None, None, None, None, 48],
-    ["SO20241107003", "BOX-200", None, None, None, None, 30],
-    ["SO20241107004", "BTL-500", None, None, None, None, 8],
-    ["SO20241107004", "BOX-1000", None, None, None, None, 4],
+    ["SO20241107001", "BTL-500", 24, "冷藏"],
+    ["SO20241107001", "BTL-500", 12, "冷藏"],  # 同一 SKU 两行 → 合并为 36
+    ["SO20241107001", "BOX-500", 10, "冷藏"],
+    ["SO20241107002", "BTL-1000", 18, "冷冻"],
+    ["SO20241107002", "BOX-200", 24, "冷冻"],
+    ["SO20241107002", "BOX-1000", 6, "冷冻"],
+    ["SO20241107003", "BTL-330", 48, "冷藏"],
+    ["SO20241107003", "BOX-200", 30, "冷藏"],
+    ["SO20241107004", "BTL-500", 8, "常温"],
+    ["SO20241107004", "BOX-1000", 4, "常温"],
 ]
 
 
@@ -477,13 +501,17 @@ def build_template(bytes_io: io.BytesIO, kind: str) -> io.BytesIO:
         ws.title = "包装箱列表"
         _write_sheet(
             ws,
-            ["箱型编码", "箱型名称", "内长(mm)", "内宽(mm)", "内高(mm)", "最大承重(g)", "单价(元)"],
+            ["箱型编码", "箱型名称", "内长(mm)", "内宽(mm)", "内高(mm)", "最大承重(g)", "单价(元)", "箱自重(g)"],
             SAMPLE_CARTONS,
         )
     elif kind == "orders":
         ws = wb.active
         ws.title = "订单明细"
-        _write_sheet(ws, ["订单号", "货品编码", "数量"], [[r[0], r[1], r[6]] for r in SAMPLE_ORDER_ROWS])
+        _write_sheet(
+            ws,
+            ["订单号", "货品编码", "数量", "订单类型"],
+            SAMPLE_ORDER_ROWS,
+        )
 
         master = wb.create_sheet("货品档案")
         _write_sheet(
@@ -493,6 +521,149 @@ def build_template(bytes_io: io.BytesIO, kind: str) -> io.BytesIO:
         )
     else:
         raise ValueError(f"未知模板类型：{kind}")
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+# ---------------------------------------------------------------------------
+# 导出：在原订单表上追加「推荐装箱方案1 / 2 / 3」
+# ---------------------------------------------------------------------------
+
+
+def _candidate_text(order: dict[str, Any] | None, idx: int) -> str:
+    """把第 idx 个候选方案格式化成一段可读文字。"""
+    if not order:
+        return ""
+    candidates = order.get("candidates") or []
+    if idx >= len(candidates):
+        return "无可用方案"
+
+    cand = candidates[idx]
+    cartons = cand.get("cartons") or []
+    if not cartons:
+        return "无可用方案"
+
+    codes = sorted({c["carton"]["code"] for c in cartons})
+    label = "+".join(codes)
+    count = cand.get("carton_count", 0)
+    fill = cand.get("fill_rate", 0.0) * 100
+    weight = cand.get("total_weight", 0.0) / 1000.0
+
+    flags = []
+    flags.append("承重OK" if cand.get("weight_ok") else "超重")
+    usage = cand.get("coolant_usage") or []
+    if usage:
+        flags.append(
+            "/".join(f"{u.get('kind_label') or u.get('code')}{u.get('qty')}块" for u in usage)
+        )
+    else:
+        flags.append("无冷媒")
+    if not cand.get("coolant_ok", True):
+        flags.append("冷媒未放全")
+    if cand.get("unplaced"):
+        left = sum(u["qty"] for u in cand["unplaced"])
+        flags.append(f"剩{left}件")
+
+    return f"{label}×{count}箱｜填充{fill:.1f}%｜{weight:.2f}kg｜" + "｜".join(flags)
+
+
+def export_with_recommendations(
+    source: str | Path | io.BytesIO,
+    result: dict[str, Any],
+) -> io.BytesIO:
+    """在原订单 Excel 右侧追加三列推荐方案，并附一张明细表。
+
+    * 新列：``推荐装箱方案1`` / ``推荐装箱方案2`` / ``推荐装箱方案3``；
+    * 每行按订单号匹配，同一订单的多行会得到相同推荐；
+    * 额外增加 ``装箱方案明细`` sheet，列出每个订单 3 套方案的完整指标。
+    """
+    wb = load_workbook(source)
+
+    target = None
+    best_score = -1
+    for name in wb.sheetnames:
+        ws = wb[name]
+        header_row, mapping, _rows = _locate_table(ws, ORDER_ALIASES)
+        if header_row < 0:
+            continue
+        score = sum(1 for key in ("order_no", "sku", "qty") if mapping.get(key) is not None)
+        if score > best_score:
+            best_score = score
+            target = (ws, header_row, mapping)
+
+    if not target or best_score < 3:
+        raise ValueError("订单文件缺少必要列：订单号 / 货品编码 / 数量")
+
+    ws, header_row, mapping = target
+    order_col = mapping["order_no"] + 1  # openpyxl 1 基列号
+    header_1b = header_row + 1
+
+    # 订单号 → 结果
+    index = {str(o.get("order_no")): o for o in result.get("orders", [])}
+
+    start_col = ws.max_column + 1
+    titles = ["推荐装箱方案1", "推荐装箱方案2", "推荐装箱方案3"]
+    for offset, title in enumerate(titles):
+        col = start_col + offset
+        cell = ws.cell(row=header_1b, column=col, value=title)
+        cell.fill = _HEADER_FILL
+        cell.font = _HEADER_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.column_dimensions[get_column_letter(col)].width = 46
+
+    for row in range(header_1b + 1, ws.max_row + 1):
+        raw = ws.cell(row=row, column=order_col).value
+        order_no = str(raw).strip() if raw is not None else ""
+        order = index.get(order_no)
+        for offset in range(len(titles)):
+            ws.cell(row=row, column=start_col + offset, value=_candidate_text(order, offset))
+
+    # ---- 明细表 ----
+    detail = wb.create_sheet("装箱方案明细")
+    detail_headers = [
+        "订单号",
+        "订单类型",
+        "温度范围(℃)",
+        "方案",
+        "箱型",
+        "箱数",
+        "货品件数",
+        "填充率",
+        "总重(kg)",
+        "承重是否达标",
+        "冷媒用量",
+        "说明",
+    ]
+    _write_sheet(detail, detail_headers, [])
+
+    for order in result.get("orders", []):
+        for cand in order.get("candidates", []):
+            cartons = cand.get("cartons") or []
+            codes = "+".join(sorted({c["carton"]["code"] for c in cartons})) or "-"
+            temp = cand.get("temperature") or {}
+            usage = "、".join(
+                f"{u.get('kind_label') or u.get('code')}×{u.get('qty')}"
+                for u in (cand.get("coolant_usage") or [])
+            ) or "无"
+            detail.append(
+                [
+                    order.get("order_no", ""),
+                    order.get("order_type", ""),
+                    f"{temp.get('min', '')}~{temp.get('max', '')}",
+                    cand.get("label", ""),
+                    codes,
+                    cand.get("carton_count", 0),
+                    cand.get("item_count", 0),
+                    round(cand.get("fill_rate", 0.0) * 100, 1),
+                    round(cand.get("total_weight", 0.0) / 1000.0, 2),
+                    "是" if cand.get("weight_ok") else "否",
+                    usage,
+                    cand.get("reason", ""),
+                ]
+            )
 
     buffer = io.BytesIO()
     wb.save(buffer)

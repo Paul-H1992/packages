@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>包装预估 · 3D 装箱方案</title>
+  <title>包装预估 · 冷链 3D 装箱方案</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234d8dff'/%3E%3Cpath d='M16 6 26 11v10l-10 5-10-5V11z' fill='none' stroke='%23fff' stroke-width='2' stroke-linejoin='round'/%3E%3Cpath d='M6 11l10 5 10-5M16 16v10' fill='none' stroke='%23fff' stroke-width='2' stroke-linejoin='round'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/static/style.css" />
   <script type="importmap">
@@ -22,7 +22,7 @@
         <div class="brand-mark">3D</div>
         <div>
           <h1>包装预估</h1>
-          <p>瓶装 / 盒装 · 逐层堆叠 · 三维预览</p>
+          <p>瓶装 / 盒装 · 冷链冷媒 · 三维预览</p>
         </div>
       </header>
 
@@ -52,7 +52,7 @@
       </section>
 
       <section class="block">
-        <h2>2. 算法参数</h2>
+        <h2>2. 装箱参数</h2>
         <div class="field">
           <label>瓶装排布</label>
           <div class="segmented" id="patternGroup">
@@ -77,14 +77,110 @@
             <label>盒装旋转</label>
             <label class="switch">
               <input type="checkbox" id="rotateBox" checked />
-              <span>允许水平 90°</span>
+              <span>允许 90°</span>
+            </label>
+          </div>
+        </div>
+        <div class="field two-col">
+          <div>
+            <label for="topK">输出方案数</label>
+            <input type="number" id="topK" value="3" min="1" max="5" step="1" />
+          </div>
+          <div>
+            <label>承重过滤</label>
+            <label class="switch">
+              <input type="checkbox" id="weightFilter" checked />
+              <span>超重不推荐</span>
             </label>
           </div>
         </div>
         <label class="switch">
           <input type="checkbox" id="respectWeight" checked />
-          <span>遵守包装箱最大承重</span>
+          <span>装箱时遵守最大承重</span>
         </label>
+      </section>
+
+      <section class="block">
+        <h2>3. 冷链配置</h2>
+        <label class="switch">
+          <input type="checkbox" id="coldEnabled" checked />
+          <span>启用冷链（计算蓝冰 / 干冰）</span>
+        </label>
+
+        <div class="field">
+          <label for="orderType">默认订单类型</label>
+          <select id="orderType">
+            <option value="常温">常温 15~25℃</option>
+            <option value="冷藏" selected>冷藏 2~8℃</option>
+            <option value="冷冻">冷冻 -20~-10℃</option>
+            <option value="深冷">深冷 -80~-60℃</option>
+            <option value="custom">自定义</option>
+          </select>
+        </div>
+
+        <div class="field two-col">
+          <div>
+            <label for="tempMin">温度下限 ℃</label>
+            <input type="number" id="tempMin" value="2" step="1" />
+          </div>
+          <div>
+            <label for="tempMax">温度上限 ℃</label>
+            <input type="number" id="tempMax" value="8" step="1" />
+          </div>
+        </div>
+
+        <div class="field two-col">
+          <div>
+            <label for="goodsRatio">货物占比 %</label>
+            <input type="number" id="goodsRatio" value="75" min="1" max="100" step="1" />
+          </div>
+          <div>
+            <label for="ratioBasis">占比基准</label>
+            <select id="ratioBasis">
+              <option value="weight">按重量</option>
+              <option value="volume">按体积</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="coolant">
+          <div class="coolant-head">
+            <label class="switch">
+              <input type="checkbox" id="blueEnabled" checked />
+              <span>蓝冰</span>
+            </label>
+            <div class="ratio-box">
+              <input type="number" id="blueRatio" value="25" min="0" max="100" step="1" />
+              <span>%</span>
+            </div>
+          </div>
+          <div class="spec-grid">
+            <input type="number" id="blueLength" value="250" title="长 mm" />
+            <input type="number" id="blueWidth" value="150" title="宽 mm" />
+            <input type="number" id="blueHeight" value="40" title="高 mm" />
+            <input type="number" id="blueWeight" value="1000" title="单块重 g" />
+          </div>
+        </div>
+
+        <div class="coolant">
+          <div class="coolant-head">
+            <label class="switch">
+              <input type="checkbox" id="dryEnabled" />
+              <span>干冰</span>
+            </label>
+            <div class="ratio-box">
+              <input type="number" id="dryRatio" value="0" min="0" max="100" step="1" />
+              <span>%</span>
+            </div>
+          </div>
+          <div class="spec-grid">
+            <input type="number" id="dryLength" value="200" title="长 mm" />
+            <input type="number" id="dryWidth" value="120" title="宽 mm" />
+            <input type="number" id="dryHeight" value="50" title="高 mm" />
+            <input type="number" id="dryWeight" value="1000" title="单块重 g" />
+          </div>
+        </div>
+        <p class="hint">占比 = 货物 / 蓝冰 / 干冰 在总量中的份额；冷媒按整块向上取整。</p>
       </section>
 
       <section class="block">
@@ -92,11 +188,11 @@
           <button class="btn primary" id="runBtn">开始预估</button>
           <button class="btn ghost" id="sampleBtn">加载示例数据</button>
         </div>
-        <p class="hint">瓶装始终直立、不旋转；层内紧密排布，层间堆叠。</p>
+        <p class="hint">瓶装始终直立、不旋转；冷媒自动码在货物上方。</p>
       </section>
 
       <section class="block grow">
-        <h2>3. 订单结果</h2>
+        <h2>4. 订单结果</h2>
         <div id="orderList" class="order-list">
           <p class="empty-hint">导入数据后，这里会显示合并后的订单列表。</p>
         </div>
@@ -112,21 +208,25 @@
           <p id="orderSubtitle">上传包装箱列表与订单明细，点击「开始预估」</p>
         </div>
         <div class="top-actions">
-          <button class="btn ghost small" id="exportBtn" disabled>导出方案 JSON</button>
+          <button class="btn ghost small" id="excelBtn" disabled>导出 Excel</button>
+          <button class="btn ghost small" id="exportBtn" disabled>导出 JSON</button>
           <button class="btn ghost small" id="resetViewBtn" disabled>重置视角</button>
         </div>
       </div>
+
+      <div class="candidate-bar" id="candidateBar"></div>
 
       <div class="stage">
         <div id="viewport"></div>
 
         <div id="emptyState" class="empty-state">
           <div class="empty-icon">📦</div>
-          <h3>3D 装箱方案预览</h3>
-          <p>上传 Excel 或加载示例数据，算法会输出每个订单的箱型、层数与摆放坐标，并在此三维呈现。</p>
+          <h3>冷链装箱 3D 预览</h3>
+          <p>上传 Excel 或加载示例数据，算法会输出每个订单的 Top3 箱型方案、冷媒用量与摆放坐标，并在此三维呈现。</p>
           <ul>
             <li>圆瓶直立、不旋转，六边形交错紧密排布</li>
-            <li>一层一层向上堆叠，层高一致</li>
+            <li>蓝冰 / 干冰按占比自动计算，码放在货物上方</li>
+            <li>按箱型最大承重过滤，输出推荐方案 1 / 2 / 3</li>
             <li>鼠标左键旋转、滚轮缩放、右键平移</li>
           </ul>
         </div>

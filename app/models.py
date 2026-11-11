@@ -45,8 +45,9 @@ class Carton:
     length: float = 0.0  # 内长 mm，对应 x
     width: float = 0.0  # 内宽 mm，对应 y
     height: float = 0.0  # 内高 mm，对应 z
-    max_weight: float = float("inf")  # 最大承重 g
+    max_weight: float = float("inf")  # 最大承重 g（含箱体自重）
     price: Optional[float] = None  # 单箱成本（可选）
+    tare_weight: float = 0.0  # 空箱自重 g
 
     @property
     def volume(self) -> float:
@@ -82,6 +83,7 @@ class Carton:
             "max_weight": None if math.isinf(self.max_weight) else self.max_weight,
             "volume_l": mm3_to_liter(self.volume),
             "price": self.price,
+            "tare_weight": round(self.tare_weight, 2),
         }
 
 
@@ -99,6 +101,7 @@ class Item:
     length: float = 0.0  # 盒装长 mm
     width: float = 0.0  # 盒装宽 mm
     order_no: str = ""
+    is_coolant: bool = False  # 是否为冷媒（蓝冰/干冰）
 
     @property
     def footprint(self) -> tuple[float, float]:
@@ -145,6 +148,7 @@ class Item:
             length=self.length,
             width=self.width,
             order_no=self.order_no,
+            is_coolant=self.is_coolant,
         )
 
     def as_dict(self) -> dict:
@@ -161,6 +165,7 @@ class Item:
             "length": round(w, 2),
             "width": round(l, 2),
             "unit_volume_l": mm3_to_liter(self.volume),
+            "is_coolant": self.is_coolant,
         }
 
 
@@ -180,6 +185,10 @@ class PackConfig:
     strategy: str = "layer"
     #: 选箱目标：cartons=箱数最少(默认) / volume=总箱容积最小 / cost=总箱成本最低
     objective: str = "cartons"
+    #: 输出候选方案数量（默认 3，即方案1/2/3）
+    top_k: int = 3
+    #: 是否按箱型最大承重过滤（超重方案不参与排序）
+    weight_filter: bool = True
 
     def as_dict(self) -> dict:
         return {
@@ -189,6 +198,8 @@ class PackConfig:
             "respect_weight": self.respect_weight,
             "strategy": self.strategy,
             "objective": self.objective,
+            "top_k": self.top_k,
+            "weight_filter": self.weight_filter,
         }
 
 
@@ -209,6 +220,7 @@ class Placement:
     layer: int = 0
     seq: int = 0
     weight: float = 0.0
+    is_coolant: bool = False
 
     @property
     def cx(self) -> float:
@@ -238,6 +250,7 @@ class Placement:
             "layer": self.layer,
             "seq": self.seq,
             "weight": round(self.weight, 3),
+            "is_coolant": self.is_coolant,
         }
         if self.kind == "bottle":
             data["d"] = round(self.d, 2)
@@ -271,10 +284,16 @@ class CartonPlan:
     carton: Carton
     index: int
     placements: list[Placement]
-    weight: float
+    weight: float  # 箱内物品总重（货物 + 冷媒），不含箱体自重
     used_volume: float
     used_height: float
     layers: list[LayerInfo] = field(default_factory=list)
+    goods_weight: float = 0.0
+    coolant_weight: float = 0.0
+    #: 冷媒明细：[{code, name, kind, required, placed, weight}]
+    coolant_items: list[dict] = field(default_factory=list)
+    #: 冷媒是否全部放下（放不下说明这一箱装不了冷链）
+    coolant_ok: bool = True
 
     @property
     def fill_rate(self) -> float:
@@ -284,13 +303,43 @@ class CartonPlan:
     def count(self) -> int:
         return len(self.placements)
 
+    @property
+    def goods_count(self) -> int:
+        return sum(1 for p in self.placements if not p.is_coolant)
+
+    @property
+    def coolant_count(self) -> int:
+        return sum(1 for p in self.placements if p.is_coolant)
+
+    @property
+    def total_weight(self) -> float:
+        """含箱体自重的实际重量。"""
+        return self.weight + self.carton.tare_weight
+
+    @property
+    def weight_ok(self) -> bool:
+        """是否满足箱型最大承重。"""
+        return self.total_weight <= self.carton.max_weight + EPS
+
+    @property
+    def has_coolant(self) -> bool:
+        return self.coolant_weight > 0
+
     def as_dict(self) -> dict:
         return {
             "index": self.index,
             "carton": self.carton.as_dict(),
             "placements": [p.as_dict() for p in self.placements],
             "count": self.count,
+            "goods_count": self.goods_count,
+            "coolant_count": self.coolant_count,
             "weight": round(self.weight, 2),
+            "goods_weight": round(self.goods_weight, 2),
+            "coolant_weight": round(self.coolant_weight, 2),
+            "total_weight": round(self.total_weight, 2),
+            "weight_ok": self.weight_ok,
+            "coolant_ok": self.coolant_ok,
+            "coolant_items": self.coolant_items,
             "used_height": round(self.used_height, 2),
             "fill_rate": round(self.fill_rate, 4),
             "layers": [layer.as_dict() for layer in self.layers],
@@ -307,6 +356,18 @@ class OrderPlan:
     unplaced: list[tuple[Item, int]] = field(default_factory=list)
     oversize: list[Item] = field(default_factory=list)
     strategy: str = ""
+    #: 候选方案编号（1、2、3…）
+    rank: int = 0
+    #: 展示用名称，如「方案1」
+    label: str = ""
+    #: 订单类型（常温/冷藏/冷冻/深冷…）
+    order_type: str = ""
+    #: 温度区间 ℃
+    temperature: tuple[float, float] = (15.0, 25.0)
+    #: 冷媒合计用量 [{code, name, kind, qty, weight}]
+    coolant_usage: list[dict] = field(default_factory=list)
+    #: 排序说明（为什么推荐这一套）
+    reason: str = ""
 
     @property
     def carton_count(self) -> int:
@@ -314,7 +375,12 @@ class OrderPlan:
 
     @property
     def total_item_count(self) -> int:
-        return sum(plan.count for plan in self.cartons)
+        """货品件数（不含冷媒）。"""
+        return sum(plan.goods_count for plan in self.cartons)
+
+    @property
+    def total_coolant_count(self) -> int:
+        return sum(plan.coolant_count for plan in self.cartons)
 
     @property
     def total_weight(self) -> float:
@@ -338,6 +404,22 @@ class OrderPlan:
     def unplaced_count(self) -> int:
         return sum(qty for _, qty in self.unplaced)
 
+    @property
+    def weight_ok(self) -> bool:
+        return all(plan.weight_ok for plan in self.cartons)
+
+    @property
+    def coolant_ok(self) -> bool:
+        return all(plan.coolant_ok for plan in self.cartons)
+
+    @property
+    def coolant_weight(self) -> float:
+        return sum(plan.coolant_weight for plan in self.cartons)
+
+    @property
+    def total_with_tare(self) -> float:
+        return sum(plan.total_weight for plan in self.cartons)
+
     def as_dict(self, include_placements: bool = True) -> dict:
         cartons = []
         for plan in self.cartons:
@@ -347,14 +429,25 @@ class OrderPlan:
             cartons.append(data)
         return {
             "order_no": self.order_no,
+            "rank": self.rank,
+            "label": self.label or (f"方案{self.rank}" if self.rank else ""),
+            "order_type": self.order_type,
+            "temperature": {"min": self.temperature[0], "max": self.temperature[1]},
             "items": [item.as_dict() for item in self.items],
             "carton_count": self.carton_count,
             "item_count": self.total_item_count,
+            "coolant_count": self.total_coolant_count,
             "total_weight": round(self.total_weight, 2),
+            "total_with_tare": round(self.total_with_tare, 2),
+            "coolant_weight": round(self.coolant_weight, 2),
+            "coolant_usage": self.coolant_usage,
+            "weight_ok": self.weight_ok,
+            "coolant_ok": self.coolant_ok,
             "fill_rate": round(self.fill_rate, 4),
             "used_volume_l": mm3_to_liter(self.total_used_volume),
             "carton_volume_l": mm3_to_liter(self.total_carton_volume),
             "strategy": self.strategy,
+            "reason": self.reason,
             "cartons": cartons,
             "unplaced": [
                 {"sku": item.sku, "name": item.name, "qty": qty}
